@@ -36,7 +36,7 @@ $(LINTED): $(LUA_SRC) $(C_SRC) .stylua.toml .clang-format
 
 $(DLL): $(NATIVE_SRC)
 	@mkdir -p build
-	$(MINGW_CC) -shared -O2 -Wl,--no-insert-timestamp -Wall -Wextra -Werror -o $@ native/native_bridge.c -ladvapi32
+	$(MINGW_CC) -shared -O2 -Wl,--no-insert-timestamp -Wall -Wextra -Werror -o $@ native/native_bridge.c
 
 $(ZIP): $(LINTED) $(DLL) $(MOD_FILES) $(VENDOR) LICENSE tools/bundle.py
 	tools/bundle.py --prebuilt

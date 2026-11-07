@@ -1,12 +1,12 @@
 #include <windows.h>
-#include <wincrypt.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <wchar.h>
 #include "migration_bonus.h"
 #include "damage_scale.h"
 #include "damage_stub.h"
+#include "sig_match.h"
+#include "signatures.h"
 
 static HMODULE self;
 
@@ -15,61 +15,6 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD why, LPVOID p) {
     if (why == DLL_PROCESS_ATTACH)
         self = h;
     return TRUE;
-}
-
-static const unsigned char SUPPORTED_SHA256[32] = {
-    0x56, 0x04, 0x51, 0xdf, 0x38, 0xcd, 0x91, 0x13, 0x40, 0x26, 0xc2, 0x5b, 0x69, 0x53, 0x94, 0x49,
-    0xc5, 0x70, 0xf3, 0x16, 0x3e, 0x33, 0xbc, 0x8c, 0x45, 0xb4, 0xdc, 0x20, 0xb6, 0x95, 0x2c, 0xee,
-};
-
-enum { BUILD_UNREADABLE = -1, BUILD_OTHER = 0, BUILD_SUPPORTED = 1 };
-
-static int game_build(void) {
-    static int cached;
-    if (cached)
-        return cached;
-    cached = BUILD_UNREADABLE;
-
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(NULL, path, MAX_PATH);
-    FILE *f = _wfopen(path, L"rb");
-    if (!f)
-        return cached;
-
-    HCRYPTPROV provider = 0;
-    HCRYPTHASH hash = 0;
-    if (CryptAcquireContextA(&provider, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) &&
-        CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash)) {
-        static unsigned char buf[65536];
-        unsigned char digest[32];
-        DWORD length = sizeof(digest);
-        size_t n;
-        int ok = 1;
-        while (ok && (n = fread(buf, 1, sizeof(buf), f)))
-            ok = CryptHashData(hash, buf, (DWORD)n, 0);
-        if (ok && !ferror(f)) {
-            int match = CryptGetHashParam(hash, HP_HASHVAL, digest, &length, 0) &&
-                        !memcmp(digest, SUPPORTED_SHA256, sizeof(digest));
-            cached = match ? BUILD_SUPPORTED : BUILD_OTHER;
-        }
-    }
-    fclose(f);
-    if (hash)
-        CryptDestroyHash(hash);
-    if (provider)
-        CryptReleaseContext(provider, 0);
-    return cached;
-}
-
-static int build_ok(FILE *result, const char *feature) {
-    int build = game_build();
-    if (build == BUILD_SUPPORTED)
-        return 1;
-    fprintf(result,
-            build == BUILD_OTHER ? "Unsupported game executable; %s disabled."
-                                 : "Could not read the game executable; %s disabled.",
-            feature);
-    return 0;
 }
 
 static FILE *open_beside(const char *name, const char *mode) {
@@ -101,6 +46,53 @@ static unsigned char *game_image(void) {
     return (unsigned char *)GetModuleHandleW(NULL);
 }
 
+static uintptr_t sig_values[SIG_COUNT];
+static signed char sig_state[SIG_COUNT];
+
+static int text_section(const unsigned char **base, size_t *size) {
+    unsigned char *image = game_image();
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(image + ((IMAGE_DOS_HEADER *)image)->e_lfanew);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
+        if (!memcmp(sec[i].Name, ".text", 6)) {
+            *base = image + sec[i].VirtualAddress;
+            *size = sec[i].Misc.VirtualSize;
+            return 1;
+        }
+    return 0;
+}
+
+/* CODE: the matched address. FIELD: the struct offset encoded at match + at. 0 when not found exactly once. */
+static uintptr_t sig(int id) {
+    if (sig_state[id])
+        return sig_state[id] > 0 ? sig_values[id] : 0;
+    sig_state[id] = -1;
+    const Signature *s = &signatures[id];
+    const unsigned char *base, *found = NULL;
+    size_t size;
+    Pattern p;
+    if (!sig_parse(s->pattern, &p) || !text_section(&base, &size) || sig_find(base, size, &p, &found) != 1)
+        return 0;
+    if (s->kind == FIELD) {
+        int32_t disp;
+        memcpy(&disp, found + s->at, 4);
+        if (disp <= 0)
+            return 0;
+        sig_values[id] = (uintptr_t)disp;
+    } else {
+        sig_values[id] = (uintptr_t)(found + s->at);
+    }
+    sig_state[id] = 1;
+    return sig_values[id];
+}
+
+static int sigs(const int *ids, int n) {
+    for (int i = 0; i < n; i++)
+        if (!sig(ids[i]))
+            return 0;
+    return 1;
+}
+
 static void pin_self(void *any_function) {
     HMODULE pinned;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCSTR)any_function,
@@ -116,13 +108,8 @@ static void write_abs_jump(unsigned char *code, uintptr_t target) {
     memcpy(code + 6, &target, 8);
 }
 
-#define MIGRATION_RATE_RVA 0x4c3ff10
 #define MIGRATION_PROLOGUE_SIZE 15
 #define TRAMPOLINE_SIZE (MIGRATION_PROLOGUE_SIZE + ABS_JUMP_SIZE)
-
-#define REGION_GAME_STATE 0x318
-#define GAME_STATE_CALENDAR 0x2c8
-#define CALENDAR_MONTH 0x170
 
 #define MAX_BONUSES 32
 
@@ -131,13 +118,15 @@ static MonthlyRate original_rate;
 static MigrationBonus bonuses[MAX_BONUSES];
 static SRWLOCK bonus_lock = SRWLOCK_INIT;
 
+static uintptr_t region_game_state, game_state_calendar;
+
 static uintptr_t calendar_for(uintptr_t region) {
-    if (!readable(region, REGION_GAME_STATE + 8))
+    if (!readable(region, region_game_state + 8))
         return 0;
-    uintptr_t state = *(uintptr_t *)(region + REGION_GAME_STATE);
-    if (!readable(state, GAME_STATE_CALENDAR + 8))
+    uintptr_t state = *(uintptr_t *)(region + region_game_state);
+    if (!readable(state, game_state_calendar + 8))
         return 0;
-    uintptr_t calendar = *(uintptr_t *)(state + GAME_STATE_CALENDAR);
+    uintptr_t calendar = *(uintptr_t *)(state + game_state_calendar);
     return readable(calendar, CALENDAR_MONTH + 4) ? calendar : 0;
 }
 
@@ -161,11 +150,9 @@ static int monthly_rate(void *region) {
 static int install_rate_hook(void) {
     if (original_rate)
         return 1;
-    static const unsigned char expected[MIGRATION_PROLOGUE_SIZE] = {
-        0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48, 0x89, 0x7c, 0x24, 0x20,
-    };
-    unsigned char *target = game_image() + MIGRATION_RATE_RVA;
-    if (memcmp(target, expected, MIGRATION_PROLOGUE_SIZE))
+    /* the signature pins the first 15 bytes to three whole register saves, which the trampoline relocates */
+    unsigned char *target = (unsigned char *)sig(SIG_MIGRATION_RATE);
+    if (!target)
         return 0;
 
     unsigned char *trampoline = VirtualAlloc(NULL, TRAMPOLINE_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -210,13 +197,16 @@ __declspec(dllexport) int queue_migration(void *lua) {
     FILE *out = open_beside("people-result.txt", "w");
     if (!out)
         return 0;
-    if (!build_ok(out, "People"))
-        return fail(out, NULL);
+    static const int needed[] = {SIG_REGION_GAME_STATE, SIG_GAME_STATE_CALENDAR};
+    if (!sigs(needed, 2))
+        return fail(out, "Migration data not found in this game version.");
+    region_game_state = sig(SIG_REGION_GAME_STATE);
+    game_state_calendar = sig(SIG_GAME_STATE_CALENDAR);
     uintptr_t calendar = calendar_for((uintptr_t)region);
     if (parsed != 2 || !calendar || (amount != 1 && amount != 5))
         return fail(out, "Invalid settlement or migration amount.");
     if (!install_rate_hook())
-        return fail(out, "Migration hook could not be installed.");
+        return fail(out, "Migration hook not found in this game version or could not be installed.");
 
     int now = current_month(calendar);
     AcquireSRWLockExclusive(&bonus_lock);
@@ -234,23 +224,23 @@ __declspec(dllexport) int queue_migration(void *lua) {
     return 0;
 }
 
-#define UNIT_HEALTH 0x2e8
-#define UNIT_SQUAD 0x2b8
 #define DAMAGE_SITES 3
 #define THUNK_PAGE_SIZE 4096
 
+/* each site is a movss [reg+health], xmm0 of len bytes whose last 4 are the health offset */
 typedef struct {
-    uintptr_t rva;
+    int sig;
     unsigned len;
-    unsigned char bytes[9];
     void (*stub)(void);
 } DamageSite;
 
 static const DamageSite damage_sites[DAMAGE_SITES] = {
-    {0x4dabf81, 9, {0xf3, 0x41, 0x0f, 0x11, 0x86, 0xe8, 0x02, 0x00, 0x00}, damage_stub_r14},
-    {0x4dac0a4, 8, {0xf3, 0x0f, 0x11, 0x86, 0xe8, 0x02, 0x00, 0x00}, damage_stub_rsi},
-    {0x4dac3f5, 8, {0xf3, 0x0f, 0x11, 0x86, 0xe8, 0x02, 0x00, 0x00}, damage_stub_rsi},
+    {SIG_DAMAGE_R14, 9, damage_stub_r14},
+    {SIG_DAMAGE_RSI_A, 8, damage_stub_rsi},
+    {SIG_DAMAGE_RSI_B, 8, damage_stub_rsi},
 };
+
+static uintptr_t unit_health, unit_squad;
 
 static DamageScale damage_scale = {.mult = 1.0f};
 static SRWLOCK damage_lock = SRWLOCK_INIT;
@@ -259,16 +249,16 @@ static int damage_hooked;
 
 float damage_adjust_health(unsigned long long unit, float next) {
     float mult = *(volatile float *)&damage_scale.mult;
-    if (mult == 1.0f || !readable((uintptr_t)unit, UNIT_HEALTH + 4))
+    if (mult == 1.0f || !readable((uintptr_t)unit, unit_health + 4) || !readable((uintptr_t)unit, unit_squad + 4))
         return next;
     InterlockedIncrement(&damage_seen);
     AcquireSRWLockShared(&damage_lock);
-    int player = damage_is_player(&damage_scale, *(int *)((uintptr_t)unit + UNIT_SQUAD));
+    int player = damage_is_player(&damage_scale, *(int *)((uintptr_t)unit + unit_squad));
     ReleaseSRWLockShared(&damage_lock);
     if (!player)
         return next;
     InterlockedIncrement(&damage_mine);
-    return damage_adjust(*(float *)((uintptr_t)unit + UNIT_HEALTH), next, mult);
+    return damage_adjust(*(float *)((uintptr_t)unit + unit_health), next, mult);
 }
 
 static unsigned char *alloc_near(unsigned char *image) {
@@ -286,18 +276,26 @@ static unsigned char *alloc_near(unsigned char *image) {
 static int install_damage_hook(void) {
     if (damage_hooked)
         return 1;
-    unsigned char *image = game_image();
-    for (int i = 0; i < DAMAGE_SITES; i++)
-        if (memcmp(image + damage_sites[i].rva, damage_sites[i].bytes, damage_sites[i].len))
+    unsigned char *sites[DAMAGE_SITES];
+    int32_t health = 0;
+    for (int i = 0; i < DAMAGE_SITES; i++) {
+        int32_t disp;
+        if (!(sites[i] = (unsigned char *)sig(damage_sites[i].sig)))
             return 0;
+        memcpy(&disp, sites[i] + damage_sites[i].len - 4, 4);
+        if (disp <= 0 || (i && disp != health))
+            return 0;
+        health = disp;
+    }
+    if (!(unit_squad = sig(SIG_UNIT_SQUAD)))
+        return 0;
+    unit_health = (uintptr_t)health;
 
-    unsigned char *page = alloc_near(image);
+    unsigned char *page = alloc_near(game_image());
     if (!page)
         return 0;
-    for (int i = 0; i < DAMAGE_SITES; i++) {
-        const DamageSite *s = &damage_sites[i];
-        damage_build_thunk(page + i * DAMAGE_THUNK_SIZE, image + s->rva, s->bytes, s->len, s->stub);
-    }
+    for (int i = 0; i < DAMAGE_SITES; i++)
+        damage_build_thunk(page + i * DAMAGE_THUNK_SIZE, sites[i], sites[i], damage_sites[i].len, damage_sites[i].stub);
     DWORD old;
     if (!VirtualProtect(page, THUNK_PAGE_SIZE, PAGE_EXECUTE_READ, &old)) {
         VirtualFree(page, 0, MEM_RELEASE);
@@ -307,23 +305,21 @@ static int install_damage_hook(void) {
 
     DWORD olds[DAMAGE_SITES];
     for (int i = 0; i < DAMAGE_SITES; i++) {
-        if (!VirtualProtect(image + damage_sites[i].rva, damage_sites[i].len, PAGE_EXECUTE_READWRITE, &olds[i])) {
+        if (!VirtualProtect(sites[i], damage_sites[i].len, PAGE_EXECUTE_READWRITE, &olds[i])) {
             for (int j = 0; j < i; j++) {
                 DWORD unused;
-                VirtualProtect(image + damage_sites[j].rva, damage_sites[j].len, olds[j], &unused);
+                VirtualProtect(sites[j], damage_sites[j].len, olds[j], &unused);
             }
             return 0;
         }
     }
     for (int i = 0; i < DAMAGE_SITES; i++) {
-        const DamageSite *s = &damage_sites[i];
-        unsigned char *site = image + s->rva;
-        damage_patch_site(site, page + i * DAMAGE_THUNK_SIZE, s->len);
-        FlushInstructionCache(GetCurrentProcess(), site, s->len);
+        damage_patch_site(sites[i], page + i * DAMAGE_THUNK_SIZE, damage_sites[i].len);
+        FlushInstructionCache(GetCurrentProcess(), sites[i], damage_sites[i].len);
     }
     for (int i = DAMAGE_SITES - 1; i >= 0; i--) {
         DWORD unused;
-        VirtualProtect(image + damage_sites[i].rva, damage_sites[i].len, olds[i], &unused);
+        VirtualProtect(sites[i], damage_sites[i].len, olds[i], &unused);
     }
 
     pin_self(damage_adjust_health);
@@ -343,13 +339,11 @@ __declspec(dllexport) int set_damage_scale(void *lua) {
     FILE *out = open_beside("damage-result.txt", "w");
     if (!out)
         return 0;
-    if (!build_ok(out, "damage scaling"))
-        return fail(out, NULL);
     DamageScale next;
     if (!damage_parse(text, &next))
         return fail(out, "Invalid damage request.");
     if (next.mult != 1.0f && !install_damage_hook())
-        return fail(out, "Damage hook could not be installed.");
+        return fail(out, "Damage hook not found in this game version or could not be installed.");
 
     AcquireSRWLockExclusive(&damage_lock);
     damage_scale = next;
@@ -359,23 +353,15 @@ __declspec(dllexport) int set_damage_scale(void *lua) {
     return 0;
 }
 
-#define FINISH_CONSTRUCTION_RVA 0x4d0b370
-#define BUILDING_CONSTRUCTED 0x3c1
 #define MAX_FINISHED_PER_CALL 256
 
 typedef void (*FinishConstruction)(void *);
 
-static FinishConstruction finish_construction_fn(void) {
-    static const unsigned char expected[16] = {0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x48,
-                                               0x89, 0x70, 0x18, 0x48, 0x89, 0x78, 0x20, 0x55};
-    unsigned char *target = game_image() + FINISH_CONSTRUCTION_RVA;
-    return memcmp(target, expected, sizeof(expected)) ? NULL : (FinishConstruction)target;
-}
-
 static int is_constructed(uintptr_t building) {
-    if (!building || !readable(building, BUILDING_CONSTRUCTED + 1))
+    uintptr_t constructed = sig(SIG_BUILDING_CONSTRUCTED);
+    if (!building || !constructed || !readable(building, constructed + 1))
         return -1;
-    return *(volatile unsigned char *)(building + BUILDING_CONSTRUCTED) != 0;
+    return *(volatile unsigned char *)(building + constructed) != 0;
 }
 
 __declspec(dllexport) int finish_construction(void *lua) {
@@ -388,14 +374,10 @@ __declspec(dllexport) int finish_construction(void *lua) {
         fclose(in);
         return 0;
     }
-    if (!build_ok(out, "instant construction")) {
+    FinishConstruction finish = (FinishConstruction)sig(SIG_FINISH_CONSTRUCTION);
+    if (!finish || !sig(SIG_BUILDING_CONSTRUCTED)) {
         fclose(in);
-        return fail(out, NULL);
-    }
-    FinishConstruction finish = finish_construction_fn();
-    if (!finish) {
-        fclose(in);
-        return fail(out, "finishConstruction not found in this executable.");
+        return fail(out, "finishConstruction not found in this game version.");
     }
 
     unsigned long long address, done[MAX_FINISHED_PER_CALL];

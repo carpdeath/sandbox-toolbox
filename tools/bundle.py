@@ -61,7 +61,6 @@ def build_dll():
             "-o",
             str(DLL),
             str(BRIDGE_SRC),
-            "-ladvapi32",
         ]
     )
     if DLL.read_bytes()[:2] != b"MZ":

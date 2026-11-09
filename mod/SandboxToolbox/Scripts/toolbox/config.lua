@@ -30,6 +30,7 @@ local config = {
     redraw_max_ticks = 120,
     owner_wait_ticks = 10,
     raider_squads = 3,
+    fertility_rescan_ticks = 20,
 
     class = {
         engine = "RTSMultiEngineCPP",
@@ -45,6 +46,7 @@ local config = {
         squad_order = "PlayerSquadUIOrder",
         commanded_squads = "commandedSquads",
         owner_pawn = "ownerPawn",
+        regions = "regions",
         building_list = "buildingArr",
         building_lists = { "buildingArr", "independentBuildings", "lazyBuildings" },
         sites = "buildings",
@@ -69,6 +71,7 @@ local config = {
             "updateBoardVisibilityFast",
         },
         spawn_raiders = "spawnRaiders",
+        redraw_fertility = "redrawFertilitySlow",
     },
 }
 

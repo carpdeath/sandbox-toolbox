@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "migration_bonus.h"
 #include "damage_scale.h"
@@ -447,6 +448,126 @@ __declspec(dllexport) int unbuilt_buildings(void *lua) {
     for (int i = 0; i < count; i++)
         if (is_constructed(data[i]) == 0)
             fprintf(out, " %d", i);
+    fclose(out);
+    return 0;
+}
+
+#define FERTILITY_SIDE 1024
+#define FERTILITY_CELLS (FERTILITY_SIDE * FERTILITY_SIDE)
+#define FERTILITY_CELL_SIZE 217.96875f
+#define FERTILITY_ORIGIN 111600.0f
+#define FERTILITY_CHANNELS 4
+#define MAX_FERTILITY_REGIONS 64
+#define REGION_MIN_SIZE 0x1000
+
+typedef struct {
+    float *data;
+    int num;
+} FloatGrid;
+
+typedef struct {
+    int index;
+    float grid[FERTILITY_CHANNELS];
+    float limits[FERTILITY_CHANNELS];
+} FertilityCell;
+
+typedef unsigned char (*RegionContains)(void *, const double *);
+
+static FertilityCell *fertility_cells;
+static int fertility_count;
+static float *fertility_data;
+static unsigned long long fertility_regions[MAX_FERTILITY_REGIONS];
+static int fertility_region_count;
+
+static void fertility_restore(float *grid, float *limits) {
+    for (int i = 0; i < fertility_count; i++) {
+        const FertilityCell *cell = &fertility_cells[i];
+        memcpy(grid + cell->index * FERTILITY_CHANNELS, cell->grid, sizeof(cell->grid));
+        memcpy(limits + cell->index * FERTILITY_CHANNELS, cell->limits, sizeof(cell->limits));
+    }
+    fertility_count = 0;
+}
+
+static int fertility_collect(float *grid, float *limits, RegionContains contains) {
+    if (!fertility_cells && !(fertility_cells = malloc(FERTILITY_CELLS * sizeof(FertilityCell))))
+        return 0;
+    for (int y = 0; y < FERTILITY_SIDE; y++)
+        for (int x = 0; x < FERTILITY_SIDE; x++) {
+            double point[2] = {(double)((float)x * FERTILITY_CELL_SIZE - FERTILITY_ORIGIN),
+                               (double)((float)y * FERTILITY_CELL_SIZE - FERTILITY_ORIGIN)};
+            for (int r = 0; r < fertility_region_count; r++) {
+                if (!contains((void *)(uintptr_t)fertility_regions[r], point))
+                    continue;
+                FertilityCell *cell = &fertility_cells[fertility_count++];
+                cell->index = x + y * FERTILITY_SIDE;
+                memcpy(cell->grid, grid + cell->index * FERTILITY_CHANNELS, sizeof(cell->grid));
+                memcpy(cell->limits, limits + cell->index * FERTILITY_CHANNELS, sizeof(cell->limits));
+                break;
+            }
+        }
+    return 1;
+}
+
+__declspec(dllexport) int force_fertility(void *lua) {
+    (void)lua;
+    FILE *in = open_beside("fertility-request.txt", "r");
+    if (!in)
+        return 0;
+    unsigned long long engine = 0, regions[MAX_FERTILITY_REGIONS];
+    int on = 0, count = 0;
+    int parsed = fscanf(in, "%llx %d", &engine, &on);
+    while (parsed == 2 && count < MAX_FERTILITY_REGIONS && fscanf(in, "%llx", &regions[count]) == 1)
+        count++;
+    fclose(in);
+
+    FILE *out = open_beside("fertility-result.txt", "w");
+    if (!out)
+        return 0;
+    static const int needed[] = {SIG_FERTILITY_GRID, SIG_FERTILITY_LIMITS, SIG_REGION_CONTAINS};
+    if (!sigs(needed, 3))
+        return fail(out, "Fertility data not found in this game version.");
+    uintptr_t grid_at = sig(SIG_FERTILITY_GRID), limits_at = sig(SIG_FERTILITY_LIMITS);
+    if (parsed != 2 || !readable((uintptr_t)engine, (grid_at > limits_at ? grid_at : limits_at) + sizeof(FloatGrid)))
+        return fail(out, "Invalid fertility request.");
+    FloatGrid *grid = (FloatGrid *)((uintptr_t)engine + grid_at),
+              *limits = (FloatGrid *)((uintptr_t)engine + limits_at);
+    size_t bytes = FERTILITY_CELLS * FERTILITY_CHANNELS * sizeof(float);
+    if (grid->num != FERTILITY_CELLS || limits->num != FERTILITY_CELLS || !readable((uintptr_t)grid->data, bytes) ||
+        !readable((uintptr_t)limits->data, bytes))
+        return fail(out, "Fertility grid not ready. Load a village first.");
+    /* new map: drop stale backup */
+    if (fertility_data != grid->data) {
+        fertility_count = 0;
+        fertility_region_count = 0;
+        fertility_data = grid->data;
+    }
+
+    int rebuilt = 0;
+    if (!on) {
+        rebuilt = 1;
+        fertility_restore(grid->data, limits->data);
+        fertility_region_count = 0;
+    } else if (count != fertility_region_count ||
+               memcmp(regions, fertility_regions, (size_t)count * sizeof(*regions))) {
+        for (int i = 0; i < count; i++)
+            if (!readable((uintptr_t)regions[i], REGION_MIN_SIZE))
+                return fail(out, "Invalid settlement in fertility request.");
+        rebuilt = 1;
+        fertility_restore(grid->data, limits->data);
+        memcpy(fertility_regions, regions, (size_t)count * sizeof(*regions));
+        fertility_region_count = count;
+        if (!fertility_collect(grid->data, limits->data, (RegionContains)sig(SIG_REGION_CONTAINS)))
+            return fail(out, "Not enough memory for the fertility backup.");
+    }
+
+    if (on)
+        for (int i = 0; i < fertility_count; i++)
+            for (int c = 0; c < FERTILITY_CHANNELS; c++) {
+                int at = fertility_cells[i].index * FERTILITY_CHANNELS + c;
+                grid->data[at] = 1.0f;
+                limits->data[at] = 1.0f;
+            }
+    fprintf(out, "OK %d %d", fertility_count, rebuilt);
     fclose(out);
     return 0;
 }

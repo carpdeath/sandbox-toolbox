@@ -3,6 +3,7 @@ local util = require("toolbox.core.util")
 local log = require("toolbox.core.log")
 local bridge = require("toolbox.core.bridge")
 local buildings = require("toolbox.game.buildings")
+local region = require("toolbox.game.region")
 
 local M = {}
 
@@ -11,6 +12,9 @@ local key_of = util.address
 local state = {
     storage = false,
     construction = false,
+    fertility = false,
+    fertility_regions = {},
+    fertility_rescan = 0,
     saved = {},
     fresh = {},
     redraw = {},
@@ -250,6 +254,37 @@ local function fresh_pass()
     end
 end
 
+local force_fertility = bridge.export("force_fertility", "fertility", "Fertility")
+
+local function refresh_fertility_regions()
+    local hex = {}
+    for _, r in ipairs(region.owned()) do
+        hex[#hex + 1] = ("%x"):format(key_of(r))
+    end
+    table.sort(hex)
+    state.fertility_regions = hex
+end
+
+local function apply_fertility(on)
+    local actor = buildings.engine()
+    if not actor then error("Game engine actor not found. Load a village first.", 0) end
+    local request = ("%x %d %s"):format(key_of(actor), on and 1 or 0, table.concat(state.fertility_regions, " "))
+    local result = force_fertility(request)
+    local cells, rebuilt = result:match("^OK (%d+) (%d)")
+    if not cells then error(bridge.failure(result, "Fertility"), 0) end
+    if rebuilt == "1" then pcall(function() actor[config.fn.redraw_fertility](actor) end) end
+    return tonumber(cells)
+end
+
+local function fertility_pass()
+    state.fertility_rescan = state.fertility_rescan + 1
+    if state.fertility_rescan >= config.fertility_rescan_ticks then
+        state.fertility_rescan = 0
+        refresh_fertility_regions()
+    end
+    apply_fertility(true)
+end
+
 local function count(map)
     local n = 0
     for _ in pairs(map) do
@@ -279,6 +314,10 @@ local function tick()
         if not ok then log.debug("Instant construction tick failed: " .. tostring(err)) end
     end
     if next(state.redraw) then pcall(redraw_pass) end
+    if state.fertility then
+        local ok, err = pcall(fertility_pass)
+        if not ok then log.debug("Fertility tick failed: " .. tostring(err)) end
+    end
     done()
     if state.storage then
         state.rescan = state.rescan + 1
@@ -320,6 +359,21 @@ function M.set_construction(on)
     state.construction = true
     ensure_loop()
     return ("Instant construction on (%d buildings finished now)."):format(finished)
+end
+
+function M.set_fertility(on)
+    if not on then
+        state.fertility = false
+        apply_fertility(false)
+        return "100% fertility off (original fertility restored)."
+    end
+    refresh_fertility_regions()
+    if #state.fertility_regions == 0 then error("No lands of yours found. Load a village first.", 0) end
+    local cells = apply_fertility(true)
+    state.fertility = true
+    state.fertility_rescan = 0
+    ensure_loop()
+    return ("100%% fertility on (%d cells)."):format(cells)
 end
 
 local function engine()

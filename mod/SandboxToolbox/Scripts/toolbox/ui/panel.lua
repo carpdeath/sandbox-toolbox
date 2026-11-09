@@ -260,6 +260,16 @@ function M.install(api)
             switch("Buildings", "construction", api.construction, "Instant construction"),
         },
     })
+    menu.Register({
+        id = "Land",
+        tab = "Settlement",
+        title = "Land",
+        collapsible = true,
+        collapsed = false,
+        items = {
+            switch("Land", "fertility", api.fertility, "100% fertility on your lands"),
+        },
+    })
     local function toggle(id, fn, off, on)
         return button(id, off, function()
             ExecuteInGameThread(function()

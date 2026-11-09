@@ -21,6 +21,9 @@ enum {
     SIG_GAME_STATE_CALENDAR,
     SIG_BUILDING_CONSTRUCTED,
     SIG_UNIT_SQUAD,
+    SIG_FERTILITY_GRID,
+    SIG_FERTILITY_LIMITS,
+    SIG_REGION_CONTAINS,
     SIG_COUNT
 };
 
@@ -42,6 +45,11 @@ static const Signature signatures[SIG_COUNT] = {
     [SIG_BUILDING_CONSTRUCTED] = {FIELD, 2, "C6 86 ?? ?? ?? ?? 01 66 44 89 AE A1 03 00 00 44 88 AE A3 03 00 00 44 88 AE 00 07 00 00 44 39 AE C4 14 00 00"},
     /* damage function: mov edx, [unit+squad] */
     [SIG_UNIT_SQUAD] = {FIELD, 2, "8B 96 ?? ?? ?? ?? 48 8B 88 D0 02 00 00 E8 ?? ?? ?? ?? 48 85 C0 74 ?? 49 8B 8F 18 03 00 00 8B 96 B8 02 00 00 48 8B 89 D0 02 00 00 E8 ?? ?? ?? ??"},
+    /* fertility clamp: limits, then grid */
+    [SIG_FERTILITY_GRID] = {FIELD, 13, "48 8B 83 ?? ?? ?? ?? 48 03 FF 48 8B 8B ?? ?? ?? ?? 48 83 C6 04 F3 0F 10 04 F8 F3 0F 5D 04 F9"},
+    [SIG_FERTILITY_LIMITS] = {FIELD, 3, "48 8B 83 ?? ?? ?? ?? 48 03 FF 48 8B 8B ?? ?? ?? ?? 48 83 C6 04 F3 0F 10 04 F8 F3 0F 5D 04 F9"},
+    /* region contains point */
+    [SIG_REGION_CONTAINS] = {CODE, 0, "48 83 EC 28 48 8B 81 ?? ?? ?? ?? 4C 8B C2 48 85 C0 74 ?? 8B 40 08 C1 E8 1E F6 D0 A8 01 74 ?? F2 0F 10 02 66 0F 2F 81"},
 };
 // clang-format on
 

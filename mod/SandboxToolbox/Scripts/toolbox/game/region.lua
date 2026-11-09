@@ -1,5 +1,7 @@
 local util = require("toolbox.core.util")
 local player = require("toolbox.game.player")
+local buildings = require("toolbox.game.buildings")
+local config = require("toolbox.config")
 
 local M = {}
 
@@ -42,6 +44,18 @@ function M.require_owned()
     if rank == M.FOREIGN then return nil, "Select a settlement you own first." end
     if rank ~= M.OWNED then return nil, "Can't tell who owns this settlement. Hover or select one of yours." end
     return r
+end
+
+function M.owned()
+    local pawn = player.pawn()
+    local engine = buildings.engine()
+    local list = pawn and engine and util.safe(function() return engine[config.prop.regions] end, nil)
+    local found = {}
+    for i = 1, util.length(list) do
+        local r = util.safe(function() return list[i] end, nil)
+        if util.valid(r) and M.ownership(r, pawn) == M.OWNED then found[#found + 1] = r end
+    end
+    return found
 end
 
 function M.wealth(region) return util.number(region, "regionalWealth") end

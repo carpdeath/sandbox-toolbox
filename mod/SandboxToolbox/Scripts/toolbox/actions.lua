@@ -26,6 +26,7 @@ function M.build()
         stamina = armies.set_stamina,
         storage = settlement.set_storage,
         construction = settlement.set_construction,
+        fertility = settlement.set_fertility,
         bandit_camp = settlement.spawn_bandit_camp,
         raiders = settlement.spawn_raiders,
     }
